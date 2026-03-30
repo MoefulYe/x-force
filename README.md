@@ -9,7 +9,7 @@
 ## Usage
 
 ```bash
-xforce [-x <proxy_url>] [-d <tun_dev>] [--tun-cidr <cidr>] [-u <uplink_dev>] [-l <tun2socks_log>] [--slirp-log <file>] [--] <command> [args...]
+xforce [-x <proxy_url>] [-d <tun_dev>] [--tun-cidr <cidr>] [-u <uplink_dev>] [--resolv-conf <path>] [-l <tun2socks_log>] [--slirp-log <file>] [--] <command> [args...]
 ```
 
 Example:

@@ -106,3 +106,17 @@ func TestParseArgsInvalidTunCIDR(t *testing.T) {
 		t.Fatalf("expected error, got nil")
 	}
 }
+
+func TestParseArgsResolvConf(t *testing.T) {
+	cfg, err := parseArgs([]string{
+		"--resolv-conf", "/tmp/resolv.conf",
+		"--",
+		"echo", "ok",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.resolvConf != "/tmp/resolv.conf" {
+		t.Fatalf("unexpected resolvConf: %s", cfg.resolvConf)
+	}
+}

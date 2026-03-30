@@ -49,6 +49,7 @@ type config struct {
 	tunDevice  string
 	tunCIDR    string
 	uplinkDev  string
+	resolvConf string
 	tunLogPath string
 	slirpLog   string
 	showHelp   bool
@@ -62,6 +63,7 @@ type workerConfig struct {
 	tunDevice  string
 	tunCIDR    string
 	uplinkDev  string
+	resolvConf string
 	tunLogPath string
 	command    []string
 }
@@ -83,7 +85,7 @@ func usage(w io.Writer) {
 	script := filepath.Base(os.Args[0])
 	fmt.Fprintf(w, "xforce %s\n\n", version)
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s [-x <proxy_url>] [-d <tun_dev>] [--tun-cidr <cidr>] [-u <uplink_dev>] [-l <tun2socks_log>] [--slirp-log <file>] [--] <command> [args...]\n", script)
+	fmt.Fprintf(w, "  %s [-x <proxy_url>] [-d <tun_dev>] [--tun-cidr <cidr>] [-u <uplink_dev>] [--resolv-conf <path>] [-l <tun2socks_log>] [--slirp-log <file>] [--] <command> [args...]\n", script)
 	fmt.Fprintf(w, "  %s --help\n", script)
 	fmt.Fprintf(w, "  %s --version\n\n", script)
 	fmt.Fprintf(w, "Description:\n")
@@ -93,6 +95,7 @@ func usage(w io.Writer) {
 	fmt.Fprintf(w, "  -d, --device <tun_dev>      TUN device name. Default: %s\n", defaultTunDevice)
 	fmt.Fprintf(w, "      --tun-cidr <cidr>       TUN IPv4 CIDR address. Default: %s\n", defaultTunCIDR)
 	fmt.Fprintf(w, "  -u, --uplink-dev <tap_dev>  slirp4netns uplink name. Default: %s\n", defaultUplinkDevice)
+	fmt.Fprintf(w, "      --resolv-conf <path>    Bind-mount custom resolv.conf in netns.\n")
 	fmt.Fprintf(w, "  -l, --log-file <path>       tun2socks log path (default: silent).\n")
 	fmt.Fprintf(w, "      --slirp-log <path>      slirp4netns log path (default: silent).\n")
 	fmt.Fprintf(w, "  -h, --help                  Show help.\n")
@@ -275,6 +278,14 @@ func parseArgs(args []string) (config, error) {
 			cfg.uplinkDev = args[i]
 		case strings.HasPrefix(arg, "--uplink-dev="):
 			cfg.uplinkDev = strings.TrimPrefix(arg, "--uplink-dev=")
+		case arg == "--resolv-conf":
+			if i+1 >= len(args) {
+				return cfg, usageError{msg: fmt.Sprintf("option %s requires a value", arg)}
+			}
+			i++
+			cfg.resolvConf = args[i]
+		case strings.HasPrefix(arg, "--resolv-conf="):
+			cfg.resolvConf = strings.TrimPrefix(arg, "--resolv-conf=")
 		case arg == "-l" || arg == "--log-file":
 			if i+1 >= len(args) {
 				return cfg, usageError{msg: fmt.Sprintf("option %s requires a value", arg)}
@@ -362,6 +373,14 @@ func parseWorkerArgs(args []string) (workerConfig, error) {
 			cfg.uplinkDev = args[i]
 		case strings.HasPrefix(arg, "--uplink-dev="):
 			cfg.uplinkDev = strings.TrimPrefix(arg, "--uplink-dev=")
+		case arg == "--resolv-conf":
+			if i+1 >= len(args) {
+				return cfg, usageError{msg: "option --resolv-conf requires a value"}
+			}
+			i++
+			cfg.resolvConf = args[i]
+		case strings.HasPrefix(arg, "--resolv-conf="):
+			cfg.resolvConf = strings.TrimPrefix(arg, "--resolv-conf=")
 		case arg == "--tun-log":
 			if i+1 >= len(args) {
 				return cfg, usageError{msg: "option --tun-log requires a value"}
@@ -549,6 +568,9 @@ func (s *runtimeState) startWorker(ctx context.Context, cfg config, proxyURL, pr
 		"--tun-log", s.tunLogPath,
 		"--",
 	}
+	if strings.TrimSpace(cfg.resolvConf) != "" {
+		args = append(args[:len(args)-1], "--resolv-conf", cfg.resolvConf, "--")
+	}
 	args = append(args, cfg.command...)
 
 	cmd := exec.CommandContext(ctx, exePath, args...)
@@ -556,7 +578,7 @@ func (s *runtimeState) startWorker(ctx context.Context, cfg config, proxyURL, pr
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET,
+		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET | syscall.CLONE_NEWNS,
 		UidMappings: []syscall.SysProcIDMap{{
 			ContainerID: 0,
 			HostID:      os.Getuid(),
@@ -620,6 +642,12 @@ func runWorkerMain(ctx context.Context, cfg workerConfig) error {
 	if err := waitForLink(ctx, cfg.uplinkDev, ifaceRetries); err != nil {
 		return fmt.Errorf("uplink device not ready (%s): %w", cfg.uplinkDev, err)
 	}
+
+	restoreResolv, err := setupWorkerResolvConf(cfg.resolvConf)
+	if err != nil {
+		return fmt.Errorf("prepare /etc/resolv.conf: %w", err)
+	}
+	defer restoreResolv()
 
 	route, err := routeToProxy(cfg.proxyIPv4)
 	if err != nil {
@@ -809,4 +837,34 @@ func printTail(w io.Writer, path string, lines int) {
 		}
 		fmt.Fprintln(w, ln)
 	}
+}
+
+func setupWorkerResolvConf(explicitPath string) (func(), error) {
+	explicitPath = strings.TrimSpace(explicitPath)
+	if explicitPath == "" {
+		return func() {}, nil
+	}
+	return bindMountResolvConf(explicitPath)
+}
+
+func bindMountResolvConf(path string) (func(), error) {
+	src, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(src); err != nil {
+		return nil, err
+	}
+
+	target := "/etc/resolv.conf"
+	if resolved, err := filepath.EvalSymlinks(target); err == nil && resolved != "" {
+		target = resolved
+	}
+
+	if err := syscall.Mount(src, target, "", syscall.MS_BIND, ""); err != nil {
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Unmount(target, syscall.MNT_DETACH)
+	}, nil
 }
